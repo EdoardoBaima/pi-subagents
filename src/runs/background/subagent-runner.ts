@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writeAtomicJson, writeBestEffortAtomicJson } from "../../shared/atomic-json.ts";
 import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -853,7 +853,7 @@ function markParallelGroupSetupFailure(input: {
 	groupStartFlatIndex: number;
 	setupError: string;
 	failedAt: number;
-	statusPath: string;
+	writeStatusSnapshot: (context: string) => void;
 	eventsPath: string;
 	asyncDir: string;
 	runId: string;
@@ -871,7 +871,7 @@ function markParallelGroupSetupFailure(input: {
 	input.statusPayload.currentStep = input.groupStartFlatIndex;
 	input.statusPayload.lastUpdate = input.failedAt;
 	input.statusPayload.outputFile = path.join(input.asyncDir, `output-${input.groupStartFlatIndex}.log`);
-	writeAtomicJson(input.statusPath, input.statusPayload);
+	input.writeStatusSnapshot("parallel-setup-failed");
 	appendJsonl(input.eventsPath, JSON.stringify({
 		type: "subagent.parallel.completed",
 		ts: input.failedAt,
@@ -886,7 +886,7 @@ function markParallelGroupRunning(input: {
 	group: Extract<RunnerStep, { parallel: SubagentStep[] }>;
 	groupStartFlatIndex: number;
 	groupStartTime: number;
-	statusPath: string;
+	writeStatusSnapshot: (context: string) => void;
 	eventsPath: string;
 	asyncDir: string;
 	runId: string;
@@ -907,7 +907,7 @@ function markParallelGroupRunning(input: {
 	input.statusPayload.lastActivityAt = input.groupStartTime;
 	input.statusPayload.lastUpdate = input.groupStartTime;
 	input.statusPayload.outputFile = path.join(input.asyncDir, `output-${input.groupStartFlatIndex}.log`);
-	writeAtomicJson(input.statusPath, input.statusPayload);
+	input.writeStatusSnapshot("parallel-started");
 	appendJsonl(input.eventsPath, JSON.stringify({
 		type: "subagent.parallel.started",
 		ts: input.groupStartTime,
@@ -965,6 +965,24 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const eventsPath = path.join(asyncDir, "events.jsonl");
 	const logPath = path.join(asyncDir, `subagent-log-${id}.md`);
 	const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG;
+	let liveStatusWriteFailureCount = 0;
+	const reportLiveStatusWriteFailure = (context: string, error: unknown): void => {
+		liveStatusWriteFailureCount++;
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`Failed to write live async status '${statusPath}' (${context}):`, error);
+		try {
+			appendJsonl(eventsPath, JSON.stringify({
+				type: "subagent.status.write_failed",
+				ts: Date.now(),
+				runId: id,
+				context,
+				count: liveStatusWriteFailureCount,
+				error: message,
+			}));
+		} catch (eventError) {
+			console.error(`Failed to record live async status write failure '${eventsPath}':`, eventError);
+		}
+	};
 	let activeChildInterrupt: (() => void) | undefined;
 	let interrupted = false;
 	let currentActivityState: ActivityState | undefined;
@@ -1107,9 +1125,15 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		for (const node of graph.nodes) updateNode(node);
 		statusPayload.workflowGraph = graph;
 	};
-	const writeStatusPayload = (): void => {
+	const writeStatusSnapshot = (context: string, durability: "required" | "live"): void => {
 		refreshWorkflowGraph();
-		writeAtomicJson(statusPath, statusPayload);
+		if (durability === "live") {
+			writeBestEffortAtomicJson(statusPath, statusPayload, {
+				onError: (error) => reportLiveStatusWriteFailure(context, error),
+			});
+		} else {
+			writeAtomicJson(statusPath, statusPayload);
+		}
 		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" ? "subagent.nested.updated" : "subagent.nested.completed");
 	};
 	const markDynamicGraphGroup = (stepIndex: number, status: "completed" | "failed" | "running", error?: string, acceptance?: import("../../shared/types.ts").AcceptanceLedger): void => {
@@ -1209,7 +1233,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		step.model = model;
 		step.thinking = thinking;
 		statusPayload.lastUpdate = now;
-		writeStatusPayload();
+		writeStatusSnapshot("step-model", "live");
 	};
 	const updateStepFromChildEvent = (flatIndex: number, event: ChildEvent): void => {
 		const step = statusPayload.steps[flatIndex];
@@ -1297,7 +1321,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		statusPayload.lastActivityAt = now;
 		statusPayload.lastUpdate = now;
 		maybeEmitActiveLongRunning(flatIndex, now);
-		writeStatusPayload();
+		writeStatusSnapshot("child-event", "live");
 	};
 	const updateRunnerActivityState = (now: number): boolean => {
 		if (!controlConfig.enabled) return false;
@@ -1352,7 +1376,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			changed = true;
 		}
 		statusPayload.lastUpdate = now;
-		if (changed) writeStatusPayload();
+		if (changed) writeStatusSnapshot("activity-state", "live");
 		return changed;
 	};
 	if (controlConfig.enabled) {
@@ -1381,7 +1405,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				step.lastActivityAt = now;
 			}
 		}
-		writeStatusPayload();
+		writeStatusSnapshot("interrupt", "live");
 		appendJsonl(eventsPath, JSON.stringify({
 			type: "subagent.run.paused",
 			ts: now,
@@ -1431,7 +1455,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				}
 				statusPayload.lastUpdate = now;
 				markDynamicGraphGroup(stepIndex, "failed", message);
-				writeStatusPayload();
+				writeStatusSnapshot("dynamic-materialization-failed", "live");
 				results.push({ agent: step.parallel.agent, output: message, error: message, success: false, exitCode: 1 });
 				break;
 			}
@@ -1477,14 +1501,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					}
 					markDynamicGraphGroup(stepIndex, "failed", groupAcceptanceFailure, groupAcceptance);
 					statusPayload.lastUpdate = now;
-					writeStatusPayload();
+					writeStatusSnapshot("dynamic-empty-acceptance-failed", "live");
 					results.push({ agent: step.parallel.agent, output: groupAcceptanceFailure, error: groupAcceptanceFailure, success: false, exitCode: 1, acceptance: groupAcceptance });
 					break;
 				}
 				flatIndex++;
 				statusPayload.lastUpdate = now;
 				markDynamicGraphGroup(stepIndex, "completed", undefined, groupAcceptance);
-				writeStatusPayload();
+				writeStatusSnapshot("dynamic-empty-completed", "live");
 				continue;
 			}
 
@@ -1551,7 +1575,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					}));
 				}
 			}
-			writeStatusPayload();
+			writeStatusSnapshot("dynamic-materialized", "live");
 
 			const concurrency = step.concurrency ?? MAX_PARALLEL_CONCURRENCY;
 			const failFast = step.failFast ?? false;
@@ -1567,7 +1591,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					statusPayload.steps[fi].durationMs = 0;
 					statusPayload.steps[fi].exitCode = -1;
 					statusPayload.lastUpdate = skippedAt;
-					writeStatusPayload();
+					writeStatusSnapshot("dynamic-fail-fast-skip", "live");
 					return { agent: task.agent, output: "(skipped — fail-fast)", exitCode: -1 as number | null, skipped: true };
 				}
 				const taskStartTime = Date.now();
@@ -1581,7 +1605,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.outputFile = path.join(asyncDir, `output-${fi}.log`);
 				statusPayload.lastActivityAt = taskStartTime;
 				statusPayload.lastUpdate = taskStartTime;
-				writeStatusPayload();
+				writeStatusSnapshot("dynamic-step-started", "live");
 				appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.started", ts: taskStartTime, runId: id, stepIndex: fi, agent: task.agent }));
 				const singleResult = await runSingleStep(task, {
 					previousOutput, placeholder, cwd, sessionEnabled,
@@ -1616,7 +1640,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 				statusPayload.steps[fi].acceptance = singleResult.acceptance;
 				statusPayload.lastUpdate = taskEndTime;
-				writeStatusPayload();
+				writeStatusSnapshot("dynamic-step-finished", "live");
 				appendJsonl(eventsPath, JSON.stringify({
 					type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
 					ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
@@ -1710,7 +1734,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}));
 			if (failures.length > 0) markDynamicGraphGroup(stepIndex, "failed", failures[0]?.error ?? "Dynamic fanout child failed.");
 			statusPayload.lastUpdate = Date.now();
-			writeStatusPayload();
+			writeStatusSnapshot("dynamic-completed", "live");
 			if (failures.length > 0 || statusPayload.error) break;
 			continue;
 		}
@@ -1733,7 +1757,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						groupStartFlatIndex,
 						setupError: formatWorktreeTaskCwdConflict(worktreeTaskCwdConflict, cwd),
 						failedAt,
-						statusPath,
+						writeStatusSnapshot: (context) => writeStatusSnapshot(context, "live"),
 						eventsPath,
 						asyncDir,
 						runId: id,
@@ -1759,7 +1783,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						groupStartFlatIndex,
 						setupError,
 						failedAt,
-						statusPath,
+						writeStatusSnapshot: (context) => writeStatusSnapshot(context, "live"),
 						eventsPath,
 						asyncDir,
 						runId: id,
@@ -1778,7 +1802,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					group,
 					groupStartFlatIndex,
 					groupStartTime,
-					statusPath,
+					writeStatusSnapshot: (context) => writeStatusSnapshot(context, "live"),
 					eventsPath,
 					asyncDir,
 					runId: id,
@@ -1799,7 +1823,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							statusPayload.steps[fi].exitCode = -1;
 							statusPayload.steps[fi].activityState = undefined;
 							statusPayload.lastUpdate = skippedAt;
-							writeStatusPayload();
+							writeStatusSnapshot("fail-fast-skip", "live");
 							appendJsonl(eventsPath, JSON.stringify({
 								type: "subagent.step.failed", ts: skippedAt, runId: id, stepIndex: fi, agent: task.agent, exitCode: -1, durationMs: 0,
 							}));
@@ -1819,7 +1843,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.outputFile = path.join(asyncDir, `output-${fi}.log`);
 						statusPayload.lastActivityAt = taskStartTime;
 						statusPayload.lastUpdate = taskStartTime;
-						writeStatusPayload();
+						writeStatusSnapshot("parallel-step-started", "live");
 
 						appendJsonl(eventsPath, JSON.stringify({
 							type: "subagent.step.started", ts: taskStartTime, runId: id, stepIndex: fi, agent: task.agent,
@@ -1869,7 +1893,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						statusPayload.steps[fi].structuredOutputSchemaPath = singleResult.structuredOutputSchemaPath;
 						statusPayload.steps[fi].acceptance = singleResult.acceptance;
 						statusPayload.lastUpdate = taskEndTime;
-						writeStatusPayload();
+						writeStatusSnapshot("parallel-step-finished", "live");
 
 						appendJsonl(eventsPath, JSON.stringify({
 							type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
@@ -1913,7 +1937,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				}
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
 				statusPayload.lastUpdate = Date.now();
-				writeStatusPayload();
+				writeStatusSnapshot("parallel-tokens", "live");
 
 				for (const pr of parallelResults) {
 					results.push({
@@ -1985,7 +2009,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.lastActivityAt = stepStartTime;
 			statusPayload.lastUpdate = stepStartTime;
 			statusPayload.outputFile = path.join(asyncDir, `output-${flatIndex}.log`);
-			writeStatusPayload();
+			writeStatusSnapshot("step-started", "live");
 
 			appendJsonl(eventsPath, JSON.stringify({
 				type: "subagent.step.started",
@@ -2084,7 +2108,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.totalTokens = { ...previousCumulativeTokens };
 			}
 			statusPayload.lastUpdate = stepEndTime;
-			writeStatusPayload();
+			writeStatusSnapshot("step-finished", "live");
 
 			appendJsonl(eventsPath, JSON.stringify({
 				type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
@@ -2186,7 +2210,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.error = `Step failed: ${failedStep.agent}`;
 		}
 	}
-	writeStatusPayload();
+	writeStatusSnapshot("run-completed", "required");
 	appendJsonl(
 		eventsPath,
 		JSON.stringify({

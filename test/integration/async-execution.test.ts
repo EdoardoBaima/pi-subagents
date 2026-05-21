@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
 import type { MockPi } from "../support/helpers.ts";
 
@@ -1895,5 +1896,59 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
 		assert.deepEqual(status.steps[0].recentTools.map((tool: { tool: string; args: string }) => ({ tool: tool.tool, args: tool.args })), [{ tool: "bash", args: "ls" }]);
 		assert.deepEqual(status.steps[0].recentOutput, ["file-a", "file-b", "Done streaming"]);
+	});
+
+	it("background child event processing survives exhausted transient status rename retries", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ delay: 200, jsonl: [events.toolStart("bash", { command: "echo locked" })] },
+				{ delay: 200, jsonl: [events.toolEnd("bash"), events.toolResult("bash", "locked once")] },
+				{ delay: 200, jsonl: [events.assistantMessage("Recovered after status lock")] },
+			],
+		});
+
+		const id = `async-status-eperm-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		const hookPath = path.resolve("test/support/rename-eperm-hook.mjs");
+		const previousNodeOptions = process.env.NODE_OPTIONS;
+		const previousTargetDir = process.env.PI_SUBAGENTS_TEST_EPERM_STATUS_DIR;
+		const previousFailureCount = process.env.PI_SUBAGENTS_TEST_EPERM_FAILURES_AFTER_FIRST_SUCCESS;
+
+		process.env.NODE_OPTIONS = `${previousNodeOptions ? `${previousNodeOptions} ` : ""}--import=${pathToFileURL(hookPath).href}`;
+		process.env.PI_SUBAGENTS_TEST_EPERM_STATUS_DIR = asyncDir;
+		process.env.PI_SUBAGENTS_TEST_EPERM_FAILURES_AFTER_FIRST_SUCCESS = "7";
+		try {
+			executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Stream despite transient status rename locks",
+				agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+			});
+
+			const deadline = Date.now() + 10_000;
+			while (!fs.existsSync(resultPath)) {
+				if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+		} finally {
+			if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+			else process.env.NODE_OPTIONS = previousNodeOptions;
+			if (previousTargetDir === undefined) delete process.env.PI_SUBAGENTS_TEST_EPERM_STATUS_DIR;
+			else process.env.PI_SUBAGENTS_TEST_EPERM_STATUS_DIR = previousTargetDir;
+			if (previousFailureCount === undefined) delete process.env.PI_SUBAGENTS_TEST_EPERM_FAILURES_AFTER_FIRST_SUCCESS;
+			else process.env.PI_SUBAGENTS_TEST_EPERM_FAILURES_AFTER_FIRST_SUCCESS = previousFailureCount;
+		}
+
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0].output, "Recovered after status lock");
+		const eventText = fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf-8");
+		assert.match(eventText, /"type":"subagent.status.write_failed"/);
+		assert.match(eventText, /EPERM: operation not permitted, rename/);
 	});
 });
