@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lesson 0001 — From pi-subagents package to subagent tool</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --muted:#8b949e; --text:#e6edf3; --accent:#7ee787; --blue:#79c0ff; --warn:#f2cc60; --bad:#ff7b72; --line:#30363d; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, Segoe UI, sans-serif; background: radial-gradient(circle at top, #182336, var(--bg) 42rem); color:var(--text); line-height:1.55; }
+    main { max-width: 980px; margin: 0 auto; padding: 40px 22px 80px; }
+    h1 { font-size: clamp(2rem, 5vw, 4rem); line-height:1.05; margin:0 0 12px; }
+    h2 { margin-top: 42px; border-top: 1px solid var(--line); padding-top: 28px; }
+    h3 { margin-top: 28px; color: var(--accent); }
+    a { color: var(--blue); }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    pre { background:#010409; border:1px solid var(--line); padding:16px; border-radius:14px; overflow:auto; }
+    code { background:#21262d; padding:0.12rem 0.35rem; border-radius:6px; }
+    .hero { background: linear-gradient(135deg, rgba(126,231,135,.13), rgba(121,192,255,.08)); border:1px solid var(--line); border-radius:22px; padding:24px; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+    .subtitle { color:var(--muted); font-size:1.1rem; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:16px; margin:18px 0; }
+    .card { background:rgba(22,27,34,.88); border:1px solid var(--line); border-radius:18px; padding:18px; }
+    .card strong { color:var(--accent); }
+    .timeline { counter-reset: step; display:grid; gap:14px; }
+    .step { background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:16px 16px 16px 64px; position:relative; }
+    .step:before { counter-increment: step; content: counter(step); position:absolute; left:18px; top:18px; width:30px; height:30px; border-radius:50%; background:var(--accent); color:#062b12; display:grid; place-items:center; font-weight:800; }
+    .try { border-left:4px solid var(--warn); background:rgba(242,204,96,.08); padding:14px 16px; border-radius:10px; margin:18px 0; }
+    .diagram { background:#010409; border:1px solid var(--line); border-radius:18px; padding:18px; overflow:auto; }
+    .diagram svg { min-width: 820px; width:100%; height:auto; }
+    .quiz button { margin:8px 8px 0 0; background:#21262d; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:9px 12px; cursor:pointer; }
+    .quiz button:hover { border-color:var(--blue); }
+    .feedback { margin-top:12px; font-weight:700; }
+    .ok { color:var(--accent); } .no { color:var(--bad); }
+    .small { color:var(--muted); font-size:.92rem; }
+    .pill { display:inline-block; border:1px solid var(--line); background:#21262d; padding:4px 9px; border-radius:999px; margin:2px; color:var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <h1>From <code>pi-subagents</code> package to available <code>subagent</code> tool</h1>
+    <p class="subtitle">First internal map: how Pi discovers the package, loads the extension, calls its factory, and ends up with a tool the parent agent can choose.</p>
+    <p><span class="pill">package loading</span><span class="pill">extension factory</span><span class="pill">tool registration</span><span class="pill">schema</span><span class="pill">parent agent</span></p>
+  </section>
+
+  <h2>One-sentence model</h2>
+  <p><strong>Pi reads the <code>pi</code> manifest in <code>package.json</code>, loads <code>src/extension/index.ts</code>, calls its default export with <code>ExtensionAPI</code>, and that extension calls <code>pi.registerTool({ name: "subagent", ... })</code>.</strong></p>
+
+  <div class="diagram" aria-label="Discovery flow diagram">
+    <svg viewBox="0 0 980 260" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#79c0ff"/></marker></defs>
+      <rect x="20" y="40" width="145" height="90" rx="16" fill="#161b22" stroke="#30363d"/><text x="92" y="80" text-anchor="middle" fill="#e6edf3" font-size="16">pi install</text><text x="92" y="104" text-anchor="middle" fill="#8b949e" font-size="13">npm/git/local</text>
+      <line x1="165" y1="85" x2="235" y2="85" stroke="#79c0ff" stroke-width="3" marker-end="url(#arrow)"/>
+      <rect x="235" y="40" width="160" height="90" rx="16" fill="#161b22" stroke="#30363d"/><text x="315" y="78" text-anchor="middle" fill="#e6edf3" font-size="16">package.json</text><text x="315" y="104" text-anchor="middle" fill="#8b949e" font-size="13">pi.extensions</text>
+      <line x1="395" y1="85" x2="465" y2="85" stroke="#79c0ff" stroke-width="3" marker-end="url(#arrow)"/>
+      <rect x="465" y="40" width="165" height="90" rx="16" fill="#161b22" stroke="#30363d"/><text x="548" y="78" text-anchor="middle" fill="#e6edf3" font-size="16">index.ts</text><text x="548" y="104" text-anchor="middle" fill="#8b949e" font-size="13">default factory</text>
+      <line x1="630" y1="85" x2="700" y2="85" stroke="#79c0ff" stroke-width="3" marker-end="url(#arrow)"/>
+      <rect x="700" y="40" width="180" height="90" rx="16" fill="#161b22" stroke="#30363d"/><text x="790" y="78" text-anchor="middle" fill="#e6edf3" font-size="16">registerTool</text><text x="790" y="104" text-anchor="middle" fill="#8b949e" font-size="13">name: subagent</text>
+      <line x1="790" y1="130" x2="790" y2="180" stroke="#79c0ff" stroke-width="3" marker-end="url(#arrow)"/>
+      <rect x="650" y="180" width="280" height="48" rx="14" fill="#0f2a18" stroke="#238636"/><text x="790" y="210" text-anchor="middle" fill="#7ee787" font-size="16">Parent agent can call subagent</text>
+    </svg>
+  </div>
+
+  <h2>Grounding sources</h2>
+  <div class="grid">
+    <div class="card"><strong>Pi package docs</strong><br/>Packages declare resources under <code>package.json.pi</code>; installed packages can contribute extensions, skills, prompts, and themes. <a href="file:///C:/Users/Edoardo/AppData/Roaming/fnm/node-versions/v24.12.0/installation/node_modules/@earendil-works/pi-coding-agent/docs/packages.md">packages.md</a></div>
+    <div class="card"><strong>Pi extension docs</strong><br/>Extensions export a default function receiving <code>ExtensionAPI</code> and can call <code>pi.registerTool()</code>. <a href="file:///C:/Users/Edoardo/AppData/Roaming/fnm/node-versions/v24.12.0/installation/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md">extensions.md</a></div>
+    <div class="card"><strong>Concrete manifest</strong><br/><code>pi-subagents/package.json</code> declares <code>./src/extension/index.ts</code> as its extension, plus skills and prompts. <a href="../../package.json">package.json</a></div>
+    <div class="card"><strong>Concrete extension</strong><br/><code>src/extension/index.ts</code> defines <code>registerSubagentExtension</code> and calls <code>pi.registerTool(tool)</code>. <a href="../../src/extension/index.ts">src/extension/index.ts</a></div>
+  </div>
+
+  <h2>The discovery timeline</h2>
+  <div class="timeline">
+    <div class="step"><strong>Installation records the package source.</strong><br/>User-facing install is <code>pi install npm:pi-subagents</code>. Pi package docs say npm, git, and local package sources can be installed and then loaded by Pi.</div>
+    <div class="step"><strong>Pi inspects package resources.</strong><br/>The manifest says:
+      <pre>{
+  "pi": {
+    "extensions": ["./src/extension/index.ts"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts"]
+  }
+}</pre>
+      That means this package contributes one extension entrypoint plus skill and prompt resources.</div>
+    <div class="step"><strong>Pi loads the TypeScript extension.</strong><br/>Pi extension docs state extensions are TypeScript modules loaded through <code>jiti</code>, so no build step is required for <code>index.ts</code>.</div>
+    <div class="step"><strong>Pi calls the default exported factory.</strong><br/>In this repo, the export is <code>export default function registerSubagentExtension(pi: ExtensionAPI): void</code>. The <code>pi</code> object is the extension's access to Pi internals.</div>
+    <div class="step"><strong>The extension avoids recursively registering in ordinary child agents.</strong><br/>At the top of the factory, it checks <code>SUBAGENT_CHILD_ENV</code>. If this Pi process is a child subagent, it normally returns early. This prevents every child from automatically exposing another full <code>subagent</code> tool unless special fanout-child mode is active.</div>
+    <div class="step"><strong>The extension initializes runtime state.</strong><br/>It creates result/async directories, loads config, starts result watchers, creates async job tracking, and builds a foreground executor with <code>createSubagentExecutor(...)</code>.</div>
+    <div class="step"><strong>The extension builds the tool definition.</strong><br/>The local variable <code>tool</code> has <code>name: "subagent"</code>, a long description, <code>parameters: SubagentParams</code>, an <code>execute(...)</code> function, and TUI renderers.</div>
+    <div class="step"><strong>The extension registers the tool.</strong><br/><code>pi.registerTool(tool)</code> is the decisive line. After this, Pi has a custom tool named <code>subagent</code> in its tool registry for the parent agent.</div>
+    <div class="step"><strong>The model sees the tool contract.</strong><br/>When tools are active, Pi can serialize the tool name, description, and parameter schema into the provider request. The parent model can then emit a tool call like <code>{ action: "list" }</code> or <code>{ agent: "reviewer", task: "..." }</code>.</div>
+  </div>
+
+  <h2>The key source landmarks</h2>
+  <pre>// package.json
+"pi": {
+  "extensions": ["./src/extension/index.ts"],
+  "skills": ["./skills"],
+  "prompts": ["./prompts"]
+}</pre>
+
+  <pre>// src/extension/index.ts
+export default function registerSubagentExtension(pi: ExtensionAPI): void {
+  ...
+  const tool: ToolDefinition&lt;typeof SubagentParams, Details&gt; = {
+    name: "subagent",
+    parameters: SubagentParams,
+    execute(id, params, signal, onUpdate, ctx) {
+      return executeSubagentCollapsed(id, params, signal, onUpdate, ctx);
+    },
+    ...
+  };
+
+  pi.registerTool(tool);
+}</pre>
+
+  <pre>// src/extension/schemas.ts
+export const SubagentParams = Type.Object({
+  agent: Type.Optional(Type.String(...)),
+  action: Type.Optional(Type.String({ enum: [...SUBAGENT_ACTIONS] })),
+  tasks: Type.Optional(Type.Array(TaskItem, ...)),
+  chain: Type.Optional(Type.Array(ChainItem, ...)),
+  context: Type.Optional(Type.String({ enum: ["fresh", "fork"] })),
+  async: Type.Optional(Type.Boolean(...)),
+  ...
+});</pre>
+
+  <h2>What is <em>not</em> happening</h2>
+  <ul>
+    <li>Installing <code>pi-subagents</code> does <strong>not</strong> start background reviewers automatically. The README explicitly says it gives Pi a delegation tool.</li>
+    <li>The builtin agents are not themselves the tool. They are discoverable configurations/prompts that the <code>subagent</code> tool can execute.</li>
+    <li>The package manifest does not execute work. It only tells Pi which resources to load.</li>
+  </ul>
+
+  <h2>Try this: source-tracing exercise</h2>
+  <div class="try">
+    <p><strong>Open these three files and trace the chain:</strong></p>
+    <ol>
+      <li><code>package.json</code> — find the <code>pi.extensions</code> entry.</li>
+      <li><code>src/extension/index.ts</code> — find <code>export default function registerSubagentExtension</code>.</li>
+      <li><code>src/extension/index.ts</code> — find <code>pi.registerTool(tool)</code>.</li>
+    </ol>
+    <p>Then answer: <em>which exact line makes <code>subagent</code> available as a callable tool?</em></p>
+  </div>
+
+  <h2>Mini-quiz</h2>
+  <div class="card quiz">
+    <p><strong>Question 1.</strong> Which file tells Pi that <code>src/extension/index.ts</code> should be loaded?</p>
+    <button onclick="answer(this, true)">package.json</button>
+    <button onclick="answer(this, false)">README.md</button>
+    <button onclick="answer(this, false)">agents/reviewer.md</button>
+    <div class="feedback"></div>
+  </div>
+  <div class="card quiz">
+    <p><strong>Question 2.</strong> Which call makes the custom tool available?</p>
+    <button onclick="answer(this, false)">loadConfig()</button>
+    <button onclick="answer(this, true)">pi.registerTool(tool)</button>
+    <button onclick="answer(this, false)">discoverAgents(...)</button>
+    <div class="feedback"></div>
+  </div>
+  <div class="card quiz">
+    <p><strong>Question 3.</strong> What does <code>SubagentParams</code> define?</p>
+    <button onclick="answer(this, false)">The child agent's system prompt text</button>
+    <button onclick="answer(this, true)">The JSON schema/contract for the subagent tool arguments</button>
+    <button onclick="answer(this, false)">The package installation path</button>
+    <div class="feedback"></div>
+  </div>
+
+  <h2>Stop point for this lesson</h2>
+  <p>If you can say the following without looking, you have the first map:</p>
+  <blockquote class="card">“<code>pi-subagents</code> is a Pi package. Its <code>package.json</code> exposes <code>src/extension/index.ts</code> as an extension. Pi loads that extension and passes <code>ExtensionAPI</code>. The extension defines a <code>ToolDefinition</code> named <code>subagent</code>, with <code>SubagentParams</code> as its argument schema, and registers it with <code>pi.registerTool(tool)</code>.”</blockquote>
+
+  <p class="small">Generated for the teaching workspace. Next lesson candidate: what happens inside <code>execute(...)</code> after the model calls <code>subagent</code>.</p>
+</main>
+<script>
+  function answer(btn, ok) {
+    const box = btn.parentElement.querySelector('.feedback');
+    box.className = 'feedback ' + (ok ? 'ok' : 'no');
+    box.textContent = ok ? 'Correct.' : 'Not quite — trace package.json → extension factory → registerTool.';
+  }
+</script>
+</body>
+</html>
