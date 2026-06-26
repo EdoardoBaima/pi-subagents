@@ -1,73 +1,100 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const TRANSIENT_RENAME_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
-const exhaustedTransientRenameErrors = new WeakSet<object>();
-const DEFAULT_RENAME_RETRIES = 6;
-const DEFAULT_RENAME_RETRY_DELAY_MS = 10;
+type AtomicJsonFs = Pick<typeof fs, "mkdirSync" | "writeFileSync" | "renameSync" | "rmSync">;
 
-export interface WriteAtomicJsonOptions {
-	maxRenameRetries?: number;
-	renameRetryDelayMs?: number;
-}
+export type AtomicJsonWriterOptions = {
+	fs?: AtomicJsonFs;
+	now?: () => number;
+	pid?: number;
+	random?: () => number;
+	retryRenameErrors?: boolean;
+	retryDelaysMs?: readonly number[];
+	wait?: (delayMs: number) => void;
+};
 
-export interface WriteBestEffortAtomicJsonOptions extends WriteAtomicJsonOptions {
+export type WriteBestEffortAtomicJsonOptions = AtomicJsonWriterOptions & {
 	onError?: (error: unknown) => void;
+};
+
+const DEFAULT_RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200] as const;
+const RETRYABLE_RENAME_ERROR_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+const exhaustedRetryableRenameErrors = new WeakSet<object>();
+
+function waitSync(delayMs: number): void {
+	if (delayMs <= 0) return;
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
 }
 
-function isTransientRenameError(error: unknown): boolean {
-	return TRANSIENT_RENAME_ERROR_CODES.has((error as NodeJS.ErrnoException | undefined)?.code ?? "");
+function isRetryableRenameError(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return typeof code === "string" && RETRYABLE_RENAME_ERROR_CODES.has(code);
 }
 
-function markExhaustedTransientRenameError(error: unknown): void {
-	if (error !== null && typeof error === "object") exhaustedTransientRenameErrors.add(error);
+function markExhaustedRetryableRenameError(error: unknown): void {
+	if (error !== null && typeof error === "object") exhaustedRetryableRenameErrors.add(error);
 }
 
-function isExhaustedTransientRenameError(error: unknown): boolean {
-	return error !== null && typeof error === "object" && exhaustedTransientRenameErrors.has(error) && isTransientRenameError(error);
+function isExhaustedRetryableRenameError(error: unknown): boolean {
+	return error !== null && typeof error === "object" && exhaustedRetryableRenameErrors.has(error) && isRetryableRenameError(error);
 }
 
-function sleepSync(ms: number): void {
-	if (ms <= 0) return;
-	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-export function writeAtomicJson(filePath: string, payload: object, options: WriteAtomicJsonOptions = {}): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	const tempPath = path.join(
-		path.dirname(filePath),
-		`.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
-	);
-	const maxRenameRetries = options.maxRenameRetries ?? DEFAULT_RENAME_RETRIES;
-	const renameRetryDelayMs = options.renameRetryDelayMs ?? DEFAULT_RENAME_RETRY_DELAY_MS;
-	try {
-		fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), "utf-8");
-		for (let attempt = 0; ; attempt++) {
-			try {
-				fs.renameSync(tempPath, filePath);
-				break;
-			} catch (error) {
-				if (!isTransientRenameError(error)) throw error;
-				if (attempt >= maxRenameRetries) {
-					markExhaustedTransientRenameError(error);
-					throw error;
-				}
-				sleepSync(renameRetryDelayMs * (attempt + 1));
+function renameWithRetry(
+	fsImpl: AtomicJsonFs,
+	sourcePath: string,
+	targetPath: string,
+	retryDelaysMs: readonly number[],
+	wait: (delayMs: number) => void,
+): void {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			fsImpl.renameSync(sourcePath, targetPath);
+			return;
+		} catch (error) {
+			const delayMs = retryDelaysMs[attempt];
+			if (delayMs === undefined || !isRetryableRenameError(error)) {
+				if (delayMs === undefined && isRetryableRenameError(error)) markExhaustedRetryableRenameError(error);
+				throw error;
 			}
+			wait(delayMs);
 		}
-	} finally {
-		fs.rmSync(tempPath, { force: true });
 	}
 }
 
-// Suppresses only exhausted transient rename failures. Other write, serialization,
-// and permission failures still surface to callers.
+export function createAtomicJsonWriter(options: AtomicJsonWriterOptions = {}): (filePath: string, payload: object) => void {
+	const fsImpl = options.fs ?? fs;
+	const now = options.now ?? Date.now;
+	const pid = options.pid ?? process.pid;
+	const random = options.random ?? Math.random;
+	const retryRenameErrors = options.retryRenameErrors ?? process.platform === "win32";
+	const retryDelaysMs = retryRenameErrors ? options.retryDelaysMs ?? DEFAULT_RENAME_RETRY_DELAYS_MS : [];
+	const wait = options.wait ?? waitSync;
+	return (filePath: string, payload: object): void => {
+		fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
+		const tempPath = path.join(
+			path.dirname(filePath),
+			`.${path.basename(filePath)}.${pid}.${now()}.${random().toString(36).slice(2)}.tmp`,
+		);
+		try {
+			fsImpl.writeFileSync(tempPath, JSON.stringify(payload, null, 2), "utf-8");
+			renameWithRetry(fsImpl, tempPath, filePath, retryDelaysMs, wait);
+		} finally {
+			fsImpl.rmSync(tempPath, { force: true });
+		}
+	};
+}
+
+export const writeAtomicJson = createAtomicJsonWriter();
+
+// Live status snapshots are observability, not durability. Suppress only exhausted
+// retryable rename failures so a locked status.json cannot kill the child run;
+// serialization, temp-file writes, and non-rename failures still surface.
 export function writeBestEffortAtomicJson(filePath: string, payload: object, options: WriteBestEffortAtomicJsonOptions = {}): boolean {
 	try {
-		writeAtomicJson(filePath, payload, options);
+		createAtomicJsonWriter(options)(filePath, payload);
 		return true;
 	} catch (error) {
-		if (!isExhaustedTransientRenameError(error)) throw error;
+		if (!isExhaustedRetryableRenameError(error)) throw error;
 		try {
 			options.onError?.(error);
 		} catch {

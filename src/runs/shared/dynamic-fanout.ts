@@ -26,6 +26,7 @@ export interface DynamicCollectedResult {
 	text: string;
 	structured?: unknown;
 	error?: string;
+	timedOut?: boolean;
 	outputPath?: string;
 	artifactPaths?: ArtifactPaths;
 }
@@ -48,8 +49,8 @@ const DYNAMIC_PARALLEL_KEYS = new Set(["agent", "task", "phase", "label", "outpu
 const RUNNER_DYNAMIC_PARALLEL_KEYS = new Set([
 	...DYNAMIC_PARALLEL_KEYS,
 	"outputName", "structured", "inheritProjectContext", "inheritSkills", "skills", "outputPath", "maxSubagentDepth",
-	"structuredOutput", "structuredOutputSchema", "tools", "extensions", "mcpDirectTools", "completionGuard", "systemPrompt",
-	"systemPromptMode", "thinking", "modelCandidates", "sessionFile", "effectiveAcceptance",
+	"structuredOutput", "structuredOutputSchema", "tools", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "completionGuard", "systemPrompt",
+	"systemPromptMode", "thinking", "modelCandidates", "sessionFile", "effectiveAcceptance", "parentSessionId",
 ]);
 const DYNAMIC_COLLECT_KEYS = new Set(["as", "outputSchema"]);
 
@@ -262,7 +263,7 @@ export function materializeDynamicParallelStep(step: DynamicParallelStep, output
 export function collectDynamicResults(
 	step: DynamicParallelStep,
 	items: DynamicMaterializedItem[],
-	results: Array<Pick<SingleResult, "agent" | "exitCode" | "error" | "structuredOutput" | "artifactPaths" | "savedOutputPath"> & { output?: string; finalOutput?: string }>,
+	results: Array<Pick<SingleResult, "agent" | "exitCode" | "error" | "timedOut" | "structuredOutput" | "artifactPaths" | "savedOutputPath"> & { output?: string; finalOutput?: string }>,
 ): DynamicCollectedResult[] {
 	return items.map((entry, index) => {
 		const result = results[index];
@@ -278,6 +279,7 @@ export function collectDynamicResults(
 			text,
 			...(result?.structuredOutput !== undefined ? { structured: result.structuredOutput } : {}),
 			...(result?.error ? { error: result.error } : {}),
+			...(result?.timedOut ? { timedOut: true } : {}),
 			...(result?.savedOutputPath ? { outputPath: result.savedOutputPath } : {}),
 			...(result?.artifactPaths ? { artifactPaths: result.artifactPaths } : {}),
 		};

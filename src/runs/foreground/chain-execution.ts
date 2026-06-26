@@ -59,7 +59,7 @@ import {
 	MAX_CONCURRENCY,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
-import { resolveModelCandidate } from "../shared/model-fallback.ts";
+import { resolveSubagentModelOverride } from "../shared/model-fallback.ts";
 import { validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, outputEntryFromResult, resolveOutputReferences, validateChainOutputBindings } from "../shared/chain-outputs.ts";
@@ -102,6 +102,7 @@ interface ParallelChainRunInput {
 	globalTaskIndex: number;
 	sessionDirForIndex: (idx?: number) => string | undefined;
 	sessionFileForIndex?: (idx?: number) => string | undefined;
+	sessionFileForTask?: (agentName: string, idx?: number) => string | undefined;
 	shareEnabled: boolean;
 	artifactConfig: ArtifactConfig;
 	artifactsDir: string;
@@ -136,6 +137,8 @@ interface ParallelChainRunInput {
 	worktreeSetup?: WorktreeSetup;
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
+	timeoutMs?: number;
+	deadlineAt?: number;
 }
 
 function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details {
@@ -232,9 +235,12 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			taskStr = prefix + taskStr + suffix;
 
 			const taskAgentConfig = input.agents.find((agent) => agent.name === task.agent);
-			const effectiveModel =
-				(task.model ? resolveModelCandidate(task.model, input.availableModels, input.ctx.model?.provider) : null)
-				?? resolveModelCandidate(taskAgentConfig?.model, input.availableModels, input.ctx.model?.provider);
+			const effectiveModel = resolveSubagentModelOverride(
+				task.model ?? taskAgentConfig?.model,
+				input.ctx.model,
+				input.availableModels,
+				input.ctx.model?.provider,
+			);
 			const maxSubagentDepth = resolveChildMaxSubagentDepth(input.maxSubagentDepth, taskAgentConfig?.maxSubagentDepth);
 
 			const taskCwd = input.worktreeSetup
@@ -263,6 +269,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				? createStructuredOutputRuntime(task.outputSchema, path.join(input.chainDir, "structured-output"))
 				: undefined;
 			const result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
+				parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
 				cwd: taskCwd,
 				signal: input.signal,
 				interruptSignal: interruptController.signal,
@@ -271,7 +278,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				runId: input.runId,
 				index: input.globalTaskIndex + taskIndex,
 				sessionDir: input.sessionDirForIndex(input.globalTaskIndex + taskIndex),
-				sessionFile: input.sessionFileForIndex?.(input.globalTaskIndex + taskIndex),
+				sessionFile: input.sessionFileForTask?.(task.agent, input.globalTaskIndex + taskIndex)
+					?? input.sessionFileForIndex?.(input.globalTaskIndex + taskIndex),
 				share: input.shareEnabled,
 				artifactsDir: input.artifactConfig.enabled ? input.artifactsDir : undefined,
 				artifactConfig: input.artifactConfig,
@@ -290,6 +298,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				structuredOutput: structuredRuntime,
 				acceptance: task.acceptance,
 				acceptanceContext: { mode: "chain" },
+				timeoutMs: input.timeoutMs,
+				deadlineAt: input.deadlineAt,
 				onUpdate: input.onUpdate
 					? (progressUpdate) => {
 						const stepResults = progressUpdate.details?.results || [];
@@ -362,6 +372,7 @@ interface ChainExecutionParams {
 	shareEnabled: boolean;
 	sessionDirForIndex: (idx?: number) => string | undefined;
 	sessionFileForIndex?: (idx?: number) => string | undefined;
+	sessionFileForTask?: (agentName: string, idx?: number) => string | undefined;
 	artifactsDir: string;
 	artifactConfig: ArtifactConfig;
 	includeProgress?: boolean;
@@ -392,6 +403,8 @@ interface ChainExecutionParams {
 	nestedRoute?: NestedRouteInfo;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	timeoutMs?: number;
+	deadlineAt?: number;
 }
 
 interface ChainExecutionResult {
@@ -419,6 +432,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		shareEnabled,
 		sessionDirForIndex,
 		sessionFileForIndex,
+		sessionFileForTask,
 		artifactsDir,
 		artifactConfig,
 		includeProgress,
@@ -581,6 +595,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		tuiBehaviorOverrides = result.behaviorOverrides;
 	}
 
+	const deadlineAt = params.deadlineAt ?? (params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined);
 	let prev = "";
 	let globalTaskIndex = 0;
 	let progressCreated = false;
@@ -646,6 +661,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					globalTaskIndex,
 					sessionDirForIndex,
 					sessionFileForIndex,
+					sessionFileForTask,
 					shareEnabled,
 					artifactConfig,
 					artifactsDir,
@@ -667,6 +683,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					nestedRoute: params.nestedRoute,
 					worktreeSetup,
 					maxSubagentDepth: params.maxSubagentDepth,
+					timeoutMs: params.timeoutMs,
+					deadlineAt,
 				});
 				globalTaskIndex += step.parallel.length;
 
@@ -736,6 +754,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						output: getSingleResultOutput(result),
 						exitCode: result.exitCode,
 						error: result.error,
+						timedOut: result.timedOut,
 						outputTargetPath,
 						outputTargetExists: outputTargetPath ? fs.existsSync(outputTargetPath) : undefined,
 					};
@@ -852,6 +871,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				globalTaskIndex,
 				sessionDirForIndex,
 				sessionFileForIndex,
+				sessionFileForTask,
 				shareEnabled,
 				artifactConfig,
 				artifactsDir,
@@ -872,6 +892,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				foregroundControl,
 				nestedRoute: params.nestedRoute,
 				maxSubagentDepth: params.maxSubagentDepth,
+				timeoutMs: params.timeoutMs,
+				deadlineAt,
 			});
 			globalTaskIndex += dynamicParallelStep.parallel.length;
 
@@ -967,6 +989,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				output: getSingleResultOutput(result),
 				exitCode: result.exitCode,
 				error: result.error,
+				timedOut: result.timedOut,
 			}));
 			prev = aggregateParallelOutputs(taskResults, (i, agent) => `=== Dynamic Item ${i + 1} (${agent}, key ${materialized.items[i]?.key ?? i}) ===`);
 		} else {
@@ -1016,10 +1039,13 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const cleanTask = stepTask;
 			stepTask = prefix + stepTask + suffix;
 
-			const effectiveModel =
-				tuiOverride?.model
-				?? (seqStep.model ? resolveModelCandidate(seqStep.model, availableModels, ctx.model?.provider) : null)
-				?? resolveModelCandidate(agentConfig.model, availableModels, ctx.model?.provider);
+			const effectiveModel = tuiOverride?.model
+				?? resolveSubagentModelOverride(
+					seqStep.model ?? agentConfig.model,
+					ctx.model,
+					availableModels,
+					ctx.model?.provider,
+				);
 
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
@@ -1048,6 +1074,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				? createStructuredOutputRuntime(seqStep.outputSchema, path.join(chainDir, "structured-output"))
 				: undefined;
 			const r = await runSync(ctx.cwd, agents, seqStep.agent, stepTask, {
+				parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
 				cwd: resolveChildCwd(cwd ?? ctx.cwd, seqStep.cwd),
 				signal,
 				interruptSignal: interruptController.signal,
@@ -1056,7 +1083,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				runId,
 				index: globalTaskIndex,
 				sessionDir: sessionDirForIndex(globalTaskIndex),
-				sessionFile: sessionFileForIndex?.(globalTaskIndex),
+				sessionFile: sessionFileForTask?.(seqStep.agent, globalTaskIndex)
+					?? sessionFileForIndex?.(globalTaskIndex),
 				share: shareEnabled,
 				artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 				artifactConfig,
@@ -1075,6 +1103,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				structuredOutput: structuredRuntime,
 				acceptance: seqStep.acceptance,
 				acceptanceContext: { mode: "chain" },
+				timeoutMs: params.timeoutMs,
+				deadlineAt,
 				onUpdate: onUpdate
 					? (p) => {
 						const stepResults = p.details?.results || [];

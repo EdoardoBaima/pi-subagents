@@ -25,8 +25,10 @@ export const SUBAGENT_PARENT_CHILD_INDEX_ENV = "PI_SUBAGENT_PARENT_CHILD_INDEX";
 export const SUBAGENT_PARENT_DEPTH_ENV = "PI_SUBAGENT_PARENT_DEPTH";
 export const SUBAGENT_PARENT_PATH_ENV = "PI_SUBAGENT_PARENT_PATH";
 export const SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV = "PI_SUBAGENT_PARENT_CAPABILITY_TOKEN";
+export const SUBAGENT_PARENT_SESSION_ENV = "PI_SUBAGENT_PARENT_SESSION";
 
 interface BuildPiArgsInput {
+	parentSessionId?: string;
 	baseArgs: string[];
 	task: string;
 	sessionEnabled: boolean;
@@ -37,8 +39,10 @@ interface BuildPiArgsInput {
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
+	requireReadTool?: boolean;
 	tools?: string[];
 	extensions?: string[];
+	subagentOnlyExtensions?: string[];
 	systemPrompt?: string | null;
 	mcpDirectTools?: string[];
 	cwd?: string;
@@ -97,7 +101,10 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		args.push("--model", modelArg);
 	}
 
-	const declaredBuiltinTools = input.tools?.filter((tool) => !(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js"))) ?? [];
+	const declaredBuiltinToolsBase = input.tools?.filter((tool) => !(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js"))) ?? [];
+	const declaredBuiltinTools = input.requireReadTool && input.tools?.length && !declaredBuiltinToolsBase.includes("read")
+		? ["read", ...declaredBuiltinToolsBase]
+		: declaredBuiltinToolsBase;
 	const fanoutAuthorized = declaredBuiltinTools.includes("subagent");
 	const toolExtensionPaths: string[] = [];
 	if (input.tools?.length) {
@@ -120,11 +127,11 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		: [PROMPT_RUNTIME_EXTENSION_PATH];
 	if (input.extensions !== undefined) {
 		args.push("--no-extensions");
-		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...input.extensions])]) {
+		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...input.extensions, ...(input.subagentOnlyExtensions ?? [])])]) {
 			args.push("--extension", extPath);
 		}
 	} else {
-		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths])]) {
+		for (const extPath of [...new Set([...runtimeExtensions, ...toolExtensionPaths, ...(input.subagentOnlyExtensions ?? [])])]) {
 			args.push("--extension", extPath);
 		}
 	}
@@ -215,6 +222,8 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		env[STRUCTURED_OUTPUT_CAPTURE_ENV] = input.structuredOutput.outputPath;
 		env[STRUCTURED_OUTPUT_SCHEMA_ENV] = input.structuredOutput.schemaPath;
 	}
+
+	env[SUBAGENT_PARENT_SESSION_ENV] = input.parentSessionId ?? process.env[SUBAGENT_PARENT_SESSION_ENV] ?? "";
 
 	return { args, env, tempDir };
 }
