@@ -180,15 +180,16 @@ async function runSingleAttempt(
 		originalTask?: string;
 	},
 ): Promise<SingleResult> {
-	const modelArg = applyThinkingSuffix(model, agent.thinking);
-		const { args, env: sharedEnv, tempDir } = buildPiArgs({
+	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
+	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
+	const { args, env: sharedEnv, tempDir } = buildPiArgs({
 		baseArgs: ["--mode", "json", "-p"],
 		task,
 		sessionEnabled: shared.sessionEnabled,
 		sessionDir: options.sessionDir,
 		sessionFile: options.sessionFile,
-		model,
-		thinking: agent.thinking,
+		model: modelArg,
+		thinking: effectiveThinking,
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
 		inheritSkills: agent.inheritSkills,
@@ -518,8 +519,11 @@ async function runSingleAttempt(
 				const toolArgs = evt.args && typeof evt.args === "object" && !Array.isArray(evt.args)
 					? evt.args as Record<string, unknown>
 					: {};
+				let shouldDetachForBlockingIntercom = false;
 				if (options.allowIntercomDetach && (evt.toolName === "intercom" || evt.toolName === "contact_supervisor")) {
 					intercomStarted = true;
+					shouldDetachForBlockingIntercom = (evt.toolName === "intercom" && toolArgs.action === "ask")
+						|| (evt.toolName === "contact_supervisor" && (toolArgs.reason === "need_decision" || toolArgs.reason === "interview_request"));
 				}
 				progress.toolCount++;
 				progress.currentTool = evt.toolName;
@@ -530,6 +534,9 @@ async function runSingleAttempt(
 				observedMutationAttempt = observedMutationAttempt || mutates;
 				pendingToolResult = { tool: evt.toolName ?? "tool", path: progress.currentPath, mutates, startedAt: now };
 				fireUpdate();
+				if (shouldDetachForBlockingIntercom && !detached && !processClosed) {
+					detachForIntercom();
+				}
 			}
 
 			if (evt.type === "tool_execution_end") {
@@ -772,6 +779,16 @@ async function runSingleAttempt(
 				: `${errInfo.errorType} failed with exit code ${errInfo.exitCode}`;
 		}
 	}
+	if (result.exitCode === 0 && !result.error) {
+		const finalText = getFinalOutput(result.messages);
+		const missingStructuredOutput = options.structuredOutput
+			? !existsSync(options.structuredOutput.outputPath)
+			: false;
+		if (!finalText?.trim() && (!options.structuredOutput || missingStructuredOutput)) {
+			result.exitCode = 1;
+			result.error = "Subagent produced no output (possible model cold-start or empty response).";
+		}
+	}
 	if (options.structuredOutput && result.exitCode === 0 && !result.error) {
 		const structured = readStructuredOutput({
 			schema: options.structuredOutput.schema,
@@ -966,7 +983,6 @@ export async function runSync(
 	const modelsToTry = candidates.length > 0 ? candidates : [undefined];
 	for (let i = 0; i < modelsToTry.length; i++) {
 		const candidate = modelsToTry[i];
-		if (candidate) attemptedModels.push(candidate);
 		const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
 		const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, options, {
 			sessionEnabled,
@@ -980,12 +996,14 @@ export async function runSync(
 			originalTask: task,
 		});
 		lastResult = result;
+		if (result.model) attemptedModels.push(result.model);
+		else if (candidate) attemptedModels.push(candidate);
 		sumUsage(aggregateUsage, result.usage);
 		totalToolCount += result.progressSummary?.toolCount ?? 0;
 		totalDurationMs += result.progressSummary?.durationMs ?? 0;
 		const attemptSucceeded = result.exitCode === 0 && !result.error;
 		const attempt: ModelAttempt = {
-			model: candidate ?? result.model ?? agent.model ?? "default",
+			model: result.model ?? candidate ?? agent.model ?? "default",
 			success: attemptSucceeded,
 			exitCode: result.exitCode,
 			error: result.error,

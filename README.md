@@ -117,7 +117,21 @@ A simple rule of thumb: use `scout` before you understand the code, `researcher`
 
 ## Changing an agent's model
 
-Builtin agents inherit your current Pi default model by default. This keeps new installs from depending on a provider you may not have configured. If you want a role to use a specific model, set an override instead of copying the bundled agent file.
+Builtin agents inherit your current Pi default model by default. This keeps new installs from depending on a provider you may not have configured. If you want every subagent without its own model to use a different default, set `subagents.defaultModel`. If you want a role to use a specific model, set an override instead of copying the bundled agent file.
+
+```json
+{
+  "defaultModel": "deepseek-v4-pro",
+  "subagents": {
+    "defaultModel": "deepseek-v4-flash",
+    "agentOverrides": {
+      "oracle": {
+        "model": "deepseek-v4-pro"
+      }
+    }
+  }
+}
+```
 
 For one run, put the override in the command:
 
@@ -141,7 +155,7 @@ For a persistent override, edit settings. This example pins the reviewer everywh
 }
 ```
 
-Use `~/.pi/agent/settings.json` for a user override or the project config settings file (`.pi/settings.json` in standard Pi) for a project override. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable a builtin. Matching user and project agents also receive override fields that their frontmatter leaves unset, so a shared project config agent can keep the persona while local settings choose the model. Explicit frontmatter still wins.
+Use `~/.pi/agent/settings.json` for a user override or the project config settings file (`.pi/settings.json` in standard Pi) for a project override. `subagents.defaultModel` applies to builtin, package, user, and project agents that do not set `model` in frontmatter. Per-run model overrides and `agentOverrides.<name>.model` still win, and explicit agent frontmatter still wins over the global default. The same `agentOverrides` block can change `tools`, `skills`, inherited context, prompt text, or disable a builtin. Matching user and project agents also receive override fields that their frontmatter leaves unset, so a shared project config agent can keep the persona while local settings choose the model.
 
 If your provider rejects model IDs with thinking suffixes, set `subagents.disableThinking: true` in user or project settings. That clears bundled builtin thinking defaults in one place; an explicit higher-precedence `agentOverrides.<name>.thinking` value can opt a role back in.
 
@@ -167,6 +181,10 @@ You can also ask naturally:
 ```text
 Show me the current async runs.
 ```
+
+Async runs also write machine-readable lifecycle artifacts for observability and workflow gates. For a top-level async run, `details.asyncDir` points at a directory containing `status.json`, `events.jsonl`, `output-<index>.log`, and `subagent-log-<runId>.md`; the final summary is written to Pi's subagent results directory as `<runId>.json`. Nested async runs use the same shape under the nested async root and are discoverable through status projections that read the nested-run registry. These files are append/update artifacts only; interactive foreground behavior is unchanged.
+
+The stable v1 status/result fields are `lifecycleArtifactVersion`, `runId`/`id`, `sessionId`, `mode`, `state`, `startedAt`, `lastUpdate`, `endedAt`, `durationMs`, `cwd`, `asyncDir`, `sessionFile`, `outputFile`, `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `model`/`attemptedModels`/`modelAttempts`, `toolCount`, `turnCount`, and nested `children` when a child is allowed to launch subagents. `events.jsonl` records lifecycle transitions such as `subagent.run.started`, `subagent.step.started`, `subagent.step.completed`/`failed`/`paused`, control attention events, nested interrupt failures, and `subagent.run.completed`; run boundary events include the lifecycle artifact version. Consumers should read these JSON files instead of scraping terminal output; unknown fields and event types should be ignored for forward compatibility.
 
 If something feels misconfigured, run:
 
@@ -217,6 +235,8 @@ Add `autofix` to `/parallel-review` or `/parallel-cleanup` to apply only the syn
 ```bash
 pi install npm:pi-intercom
 ```
+
+When `pi-intercom` is not active, `pi-subagents` may recommend it at session start, in `subagent({ action: "list" })`, and in `/subagents-doctor`. The recommendation is visible to the assistant so it can offer to run the install command or hide the recommendation after you approve that action.
 
 Most users do not call `intercom` directly. After `pi-intercom` is installed, `pi-subagents` can automatically give child agents a private coordination channel back to the parent session. The bridge recognizes the normal `pi install npm:pi-intercom` package install as well as legacy local extension checkouts.
 
@@ -332,6 +352,7 @@ Skip this section until you want exact syntax.
 | `/chain scout "scan" -> (reviewer "A" \| reviewer "B") -> writer "fix"` | Run a chain with a static parallel group inline |
 | `/parallel agent1 "task1" -> agent2 "task2"` | Run agents in parallel |
 | `/run-chain <chainName> -- <task>` | Launch a saved `.chain.md` or `.chain.json` workflow |
+| `/subagent-cost` | Show parent plus child subagent token usage and cost for this session |
 | `/subagents-doctor` | Show read-only setup diagnostics |
 | `/subagents-models [agent]` | Show the runtime-loaded builtin model mapping, optionally filtered to one builtin |
 | `/subagents-profiles` | List saved subagent profiles from `~/.pi/agent/profiles/pi-subagents/` |
@@ -440,7 +461,7 @@ Append `[key=value,...]` to an agent name to override defaults. `/chain` applies
 
 | Key | Example | Description |
 |-----|---------|-------------|
-| `output` | `output=context.md` | Write results to a file. For `/chain` and `/parallel`, relative paths live under the chain directory; for `/run`, relative paths resolve against cwd. |
+| `output` | `output=context.md` | Write results to a file. Absolute paths are used as-is. Relative paths in `/run` resolve under `singleRunOutputBaseDir` when configured, otherwise under the run's output artifact directory. Relative paths in `/chain` and `/parallel` live under the chain or parallel run directory. |
 | `outputMode` | `outputMode=file-only` | Return only a concise file reference for saved output instead of the full saved content. Requires `output`; default is `inline`. |
 | `reads` | `reads=a.md+b.md` | Read files before executing. `+` separates multiple paths. |
 | `model` | `model=anthropic/claude-sonnet-4` | Override model for this step. |
@@ -483,7 +504,9 @@ You can combine them in either order:
 /run reviewer "review this diff" --bg --fork
 ```
 
-Background runs are detached. If the parent agent has other independent work, it should keep working. If it has nothing useful to do until the background result arrives, it should end the turn instead of running sleep or status-polling loops. Pi will deliver the completion when the run finishes.
+Background runs are detached. If the parent agent has other independent work, it should keep working. When it has nothing useful to do until a background result arrives, it should call the `wait` tool instead of running sleep or status-polling loops. `wait()` returns when the next active run finishes or needs attention and keeps the turn alive for normal notification delivery; use `wait({ all: true })` to drain every active run, `wait({ id })` for one run, and `wait({ timeoutMs })` to cap the block.
+
+`wait` is what lets a background-launching skill keep moving in a single turn, including non-interactive `pi -p` invocations where there is no subsequent turn to receive a completion notification. Ending the turn to wait for a completion only works in an interactive session where the user will prompt the agent again; in a run-to-completion skill or a non-interactive run, use `wait` so the still-running children are not abandoned.
 
 The `oracle` and `worker` builtins are designed for an explicit decision loop. A typical pattern is to ask `oracle` for diagnosis and a recommended execution prompt, then only run `worker` after the main agent approves that direction.
 
@@ -521,7 +544,7 @@ Agent locations, lowest to highest priority:
 
 Project discovery also reads legacy `.agents/**/*.md` files. Nested subdirectories are discovered recursively. `.chain.md` files do not define agents. Installed Pi packages can expose agent directories from either `{"pi-subagents":{"agents":["./agents"]}}` or `{"pi":{"subagents":{"agents":["./agents"]}}}` in their package manifest. Package agents load above builtins and below user/project agents. If both `.agents/` and the project config agents directory define the same parsed runtime agent name, the project config directory wins. Use `agentScope: "user" | "project" | "both"` to control discovery; `both` is the default and project definitions win runtime-name collisions.
 
-Builtin agents load at the lowest priority, so a user or project agent with the same name overrides them. They do not pin a provider model; they inherit your current Pi default model unless you set `subagents.agentOverrides.<name>.model`. `oracle` is an advisory reviewer that critiques direction and proposes an execution prompt without editing files. `worker` is the implementation agent for normal tasks and approved oracle handoffs.
+Builtin agents load at the lowest priority, so a user or project agent with the same name overrides them. They do not pin a provider model; they inherit your current Pi default model unless you set `subagents.defaultModel` or `subagents.agentOverrides.<name>.model`. `oracle` is an advisory reviewer that critiques direction and proposes an execution prompt without editing files. `worker` is the implementation agent for normal tasks and approved oracle handoffs.
 
 The `researcher` builtin uses `web_search`, `fetch_content`, and `get_search_content`; those require [pi-web-access](https://github.com/nicobailon/pi-web-access):
 
@@ -551,6 +574,8 @@ Example:
 ```
 
 Supported override fields are `model`, `fallbackModels`, `thinking`, `systemPromptMode`, `inheritProjectContext`, `inheritSkills`, `defaultContext`, `disabled`, `skills`, `tools`, and `systemPrompt`. Use `defaultContext: false` in builtin overrides to clear an inherited context default. Project overrides beat user overrides.
+
+Set `subagents.defaultModel` to give all subagents without an explicit model their own default model, separate from the parent session model. Per-agent model overrides and agent frontmatter still win.
 
 Set `disabled: true` to hide a builtin from runtime discovery and agent-facing `subagent({ action: "list" })` output. For bulk control, set `subagents.disableBuiltins: true` in settings.
 
@@ -977,6 +1002,7 @@ Agent definitions are not loaded into context by default. Management actions let
 | `clarify` | boolean | true for chains | Show TUI preview/edit flow. |
 | `agentScope` | `user \| project \| both` | `both` | Agent discovery scope. Project wins on collisions. |
 | `async` | boolean | false | Background execution. For chains, `clarify: true` explicitly keeps the run foreground for the clarify UI. |
+| `timeoutMs` / `maxRuntimeMs` | number | none | Optional run-level max runtime in milliseconds for foreground and async/background runs. |
 | `cwd` | string | runtime cwd | Override working directory. |
 | `maxOutput` | object | 200KB, 5000 lines | Final output truncation limits. |
 | `artifacts` | boolean | true | Write debug artifacts. |
@@ -985,7 +1011,7 @@ Agent definitions are not loaded into context by default. Management actions let
 | `sessionDir` | string | derived | Override session log directory. |
 | `acceptance` | string/object/false | inferred | Override the run's inferred acceptance gates. Use `"auto"`, `"attested"`, `"checked"`, `"verified"`, `"reviewed"`, or `{ level: "none", reason: "..." }`. |
 
-`context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. It never silently downgrades to `fresh`. In multi-agent runs that omit `context`, each agent/task/step follows its own `defaultContext`, so a fresh-default scout can run fresh beside a fork-default worker. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
+`context: "fork"` fails fast when the parent session is not persisted, the current leaf is missing, or the branched child session cannot be created. When the inherited transcript contains signed Anthropic `thinking` / `redacted_thinking` blocks, `pi-subagents` strips those provider-private blocks from the forked child session and forces the child run's thinking level to `off` so Anthropic does not reject modified signatures after branching or compaction. Forking never silently downgrades to `fresh`. In multi-agent runs that omit `context`, each agent/task/step follows its own `defaultContext`, so a fresh-default scout can run fresh beside a fork-default worker. Pass explicit `context: "fork"` or `context: "fresh"` when you intentionally want one context for every child.
 
 Use `outputMode: "file-only"` when a saved output may be large and the parent only needs a pointer. The returned text is a compact reference like `Output saved to: /abs/report.md (48.2 KB, 2847 lines). Read this file if needed.` Failed runs and save errors still return normal inline output for debugging. In chains, later `{previous}` steps receive the same compact reference when the prior step used file-only mode.
 
@@ -1040,6 +1066,8 @@ Requirements:
 - task-level `cwd` overrides must be omitted or match the shared cwd
 - configured `worktreeSetupHook` must return valid JSON before timeout
 
+By default, worktrees are created under the system temp directory. Set `worktreeBaseDir` in config, or `PI_SUBAGENTS_WORKTREE_DIR` when config is unset, to put them under a stable trusted directory. Missing base directories are created automatically.
+
 After a worktree parallel step completes, per-agent diff stats are appended to the output and full patch files are written to artifacts. Worktrees and temp branches are cleaned up in `finally` blocks.
 
 ## Configuration
@@ -1062,6 +1090,22 @@ Makes top-level calls use background execution when the request does not explici
 
 Forces depth-0 single, parallel, and chain runs into background mode and bypasses clarify UI by forcing `clarify: false`. Nested calls keep their own inherited settings.
 
+### `globalConcurrencyLimit`
+
+```json
+{ "globalConcurrencyLimit": 20 }
+```
+
+Caps simultaneously running subagent tasks within a single run across top-level parallel tasks, inline chain parallel groups, and dynamic fanout groups. The default is `20`; invalid values are clamped to `1`. Per-step `concurrency` and `parallel.concurrency` still apply, so effective concurrency is the lower of the local cap and the available global slots.
+
+### `maxSubagentSpawnsPerSession`
+
+```json
+{ "maxSubagentSpawnsPerSession": 40 }
+```
+
+Caps the total number of child subagent launches allowed during one parent session, including single runs, parallel task counts, static chain steps, and bounded dynamic fanout children. Set `PI_SUBAGENT_MAX_SPAWNS_PER_SESSION` to override the config for a process. The default is `40`; `0` blocks new subagent launches for that session.
+
 ### `parallel`
 
 ```json
@@ -1083,6 +1127,14 @@ Forces depth-0 single, parallel, and chain runs into background mode and bypasse
 
 Session directory precedence is: `params.sessionDir`, then `config.defaultSessionDir`, then a directory derived from the parent session. Sessions are always enabled.
 
+### `singleRunOutputBaseDir`
+
+```json
+{ "singleRunOutputBaseDir": "~/.pi/subagent-outputs" }
+```
+
+Routes relative `output` paths for single-agent `/run` calls under this directory. Absolute per-call or agent output paths are still used as-is. When unset, relative single-run outputs go under the run's output artifact directory instead of the project root.
+
 ### `maxSubagentDepth`
 
 ```json
@@ -1090,6 +1142,14 @@ Session directory precedence is: `params.sessionDir`, then `config.defaultSessio
 ```
 
 Controls nested delegation when no inherited `PI_SUBAGENT_MAX_DEPTH` is already in effect. Per-agent `maxSubagentDepth` can tighten the limit for that agent’s child runs, but cannot relax an inherited stricter limit. This applies even to children that explicitly declare `tools: subagent`; at the cap, execution fanout is blocked instead of silently hiding nested work.
+
+### `PI_SUBAGENT_PI_BINARY`
+
+```bash
+export PI_SUBAGENT_PI_BINARY=/path/to/pi-or-wrapper
+```
+
+Overrides the command used to launch child Pi processes. Package wrappers can set this to their own `pi`/agent binary so subagents inherit wrapper flags, environment setup, and bundled resources without relying on `PATH` ordering. Empty or whitespace-only values are ignored.
 
 ### `intercomBridge`
 
@@ -1112,6 +1172,36 @@ Fields:
 Bridge activation also requires `pi-intercom` to be installed and enabled through `pi install npm:pi-intercom` or a legacy local extension checkout, a targetable current session name or fallback alias, and `pi-intercom` in any explicit agent `extensions` allowlist.
 
 The default injected guidance tells children to use `contact_supervisor` with `reason: "need_decision"` when blocked or needing a decision, `reason: "progress_update"` only for meaningful blocked/progress updates, generic `intercom` as fallback plumbing, and avoid routine completion handoffs.
+
+### `companionSuggestions`
+
+```json
+{
+  "companionSuggestions": {
+    "enabled": true,
+    "packages": {
+      "pi-intercom": {
+        "surfaces": ["session_start", "list", "doctor"]
+      },
+      "pi-prompt-template-model": {
+        "surfaces": ["session_start", "list", "doctor"]
+      }
+    }
+  }
+}
+```
+
+Controls recommendations for optional companion packages. `pi-intercom` enables live supervisor decisions, progress updates, and grouped result delivery. `pi-prompt-template-model` makes subagent workflows reusable as prompt templates with model/thinking/skill/subagent frontmatter.
+
+Use `/subagents-companions status` to inspect recommendation status. Use `/subagents-companions hide pi-intercom workspace` or `/subagents-companions hide pi-prompt-template-model user` to hide a recommendation. Use `/subagents-companions show <package>` to show a workspace recommendation again. Set `companionSuggestions` to `false` to disable all companion recommendations.
+
+### `worktreeBaseDir`
+
+```json
+{ "worktreeBaseDir": "/Users/matt/code/.worktrees/pi-subagents" }
+```
+
+Sets the base directory for `worktree: true` runs. Relative paths resolve from the repository root, `~/...` expands to your home directory, and `PI_SUBAGENTS_WORKTREE_DIR` is used when config is unset. The default remains the system temp directory.
 
 ### `worktreeSetupHook`
 
@@ -1142,7 +1232,7 @@ Each chain run creates a user-scoped temp directory like:
 
 It may contain files such as `context.md`, `plan.md`, `progress.md`, and `parallel-{stepIndex}/.../output.md`. Directories older than 24 hours are cleaned up on extension startup.
 
-Debug artifacts live under `{sessionDir}/subagent-artifacts/` or a user-scoped temp artifact directory. Per task you may see:
+Debug artifacts live under `{sessionDir}/subagent-artifacts/`, `.pi-subagents/artifacts/` for project-scoped runs, or a user-scoped temp artifact directory. Single-run relative `output` files are saved under `{artifactsDir}/outputs/{runId}/` unless `singleRunOutputBaseDir` is configured. Per task you may see:
 
 - `{runId}_{agent}_input.md`
 - `{runId}_{agent}_output.md`
@@ -1199,9 +1289,9 @@ For `attested` or stricter levels, the child prompt includes a standardized acce
 
 ## Live progress
 
-Foreground runs show compact live progress for single, chain, and parallel modes: current tool, recent output, token counts, duration, activity freshness, current-tool duration, and chain graph metadata when available.
+Foreground runs show compact live progress for single, chain, and parallel modes: current tool, recent output, token counts, aggregate cost, duration, activity freshness, current-tool duration, and chain graph metadata when available.
 
-Press `Ctrl+O` to expand the full streaming view with complete output per step.
+Press Pi's configured expand key (`Ctrl+O` by default) to expand the full streaming view with complete output per step.
 
 Sequential chains show a flow line like `done scout → running planner`. Chains with parallel steps show per-step cards instead. Chain status uses `label` and `phase` metadata when present, while falling back to agent names for older chains.
 
@@ -1268,6 +1358,8 @@ Use url in the prompt to take screenshot: $@
 Then `/take-screenshot https://example.com` switches to Sonnet, delegates to `browser-screenshoter` with `/tmp/screenshots` as cwd, and restores your model when done. Runtime overrides like `--cwd=<path>` and `--subagent=<name>` work too.
 
 For more reusable workflows on top of subagents, including `/chain-prompts` and compare-style prompts such as `/best-of-n`, install `pi-prompt-template-model` separately and copy the examples you want into `~/.pi/agent/prompts/`.
+
+When `pi-prompt-template-model` is not active, `pi-subagents` may recommend it at session start, in `subagent({ action: "list" })`, and in `/subagents-doctor`. The recommendation is only a prompt; package installation still requires an explicit user-approved command.
 
 ## Runtime files
 

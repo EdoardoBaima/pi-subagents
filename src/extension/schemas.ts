@@ -235,8 +235,8 @@ const SubagentParamsSchema = Type.Object({
 	})),
 	chainDir: Type.Optional(Type.String({ description: "Persistent chain artifact directory; defaults to user-scoped temp storage." })),
 	async: Type.Optional(Type.Boolean({ description: "Run in background (default: false, or per config)" })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Foreground timeout ms; alias of maxRuntimeMs." })),
-	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias of timeoutMs for foreground timeout." })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional run-level timeout in ms for foreground and async/background runs. Alias of maxRuntimeMs." })),
+	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias of timeoutMs for optional run-level timeout in foreground and async/background runs." })),
 	agentScope: Type.Optional(Type.String({ description: "Agent discovery scope: 'user', 'project', or 'both' (default: 'both'; project wins on name collisions)" })),
 	cwd: Type.Optional(Type.String()),
 	artifacts: Type.Optional(Type.Boolean({ description: "Write debug artifacts (default: true)" })),
@@ -263,3 +263,18 @@ const SubagentParamsSchema = Type.Object({
 });
 
 export const SubagentParams = keepTopLevelParameterDescriptions(SubagentParamsSchema);
+
+const WaitParamsSchema = Type.Object({
+	id: Type.Optional(Type.String({
+		description: "Run id or prefix to wait for one specific run. Omit to wait across every active async run started in this session.",
+	})),
+	all: Type.Optional(Type.Boolean({
+		description: "Wait for ALL active runs to finish. Default false: return as soon as the first run finishes, so a fleet manager can spawn a replacement and wait again. Ignored when id targets a single run.",
+	})),
+	timeoutMs: Type.Optional(Type.Integer({
+		minimum: 1,
+		description: "Give up waiting after this many milliseconds (the runs keep going regardless). Defaults to 1800000 (30 minutes).",
+	})),
+});
+
+export const WaitParams = keepTopLevelParameterDescriptions(WaitParamsSchema);

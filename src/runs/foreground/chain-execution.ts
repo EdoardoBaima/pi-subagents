@@ -34,7 +34,8 @@ import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skill
 import { INTERCOM_BRIDGE_MARKER } from "../../intercom/intercom-bridge.ts";
 import { runSync } from "./execution.ts";
 import { buildChainSummary } from "../../shared/formatters.ts";
-import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, resolveChildCwd } from "../../shared/utils.ts";
+import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, resolveChildCwd, sumResultsCost, sumResultsUsage } from "../../shared/utils.ts";
+import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../shared/parallel-utils.ts";
 import { recordRun } from "../shared/run-history.ts";
 import {
 	cleanupWorktrees,
@@ -103,6 +104,7 @@ interface ParallelChainRunInput {
 	sessionDirForIndex: (idx?: number) => string | undefined;
 	sessionFileForIndex?: (idx?: number) => string | undefined;
 	sessionFileForTask?: (agentName: string, idx?: number) => string | undefined;
+	thinkingOverrideForTask?: (agentName: string, idx?: number) => AgentConfig["thinking"] | undefined;
 	shareEnabled: boolean;
 	artifactConfig: ArtifactConfig;
 	artifactsDir: string;
@@ -139,6 +141,7 @@ interface ParallelChainRunInput {
 	nestedRoute?: NestedRouteInfo;
 	timeoutMs?: number;
 	deadlineAt?: number;
+	globalSemaphore?: Semaphore;
 }
 
 function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details {
@@ -151,7 +154,9 @@ function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details 
 		totalSteps: input.totalSteps,
 		currentStepIndex: input.currentStepIndex,
 		outputs: input.outputs,
-	workflowGraph: buildWorkflowGraphSnapshot({
+		totalChildUsage: sumResultsUsage(input.results),
+		totalCost: sumResultsCost(input.results),
+		workflowGraph: buildWorkflowGraphSnapshot({
 			runId: input.runId,
 			mode: "chain",
 			steps: input.chainSteps,
@@ -280,6 +285,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				sessionDir: input.sessionDirForIndex(input.globalTaskIndex + taskIndex),
 				sessionFile: input.sessionFileForTask?.(task.agent, input.globalTaskIndex + taskIndex)
 					?? input.sessionFileForIndex?.(input.globalTaskIndex + taskIndex),
+				thinkingOverride: input.thinkingOverrideForTask?.(task.agent, input.globalTaskIndex + taskIndex),
 				share: input.shareEnabled,
 				artifactsDir: input.artifactConfig.enabled ? input.artifactsDir : undefined,
 				artifactConfig: input.artifactConfig,
@@ -355,6 +361,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			recordRun(task.agent, cleanTask, result.exitCode, result.progressSummary?.durationMs ?? 0);
 			return result;
 		},
+		input.globalSemaphore,
 	);
 
 	return parallelResults;
@@ -373,6 +380,7 @@ interface ChainExecutionParams {
 	sessionDirForIndex: (idx?: number) => string | undefined;
 	sessionFileForIndex?: (idx?: number) => string | undefined;
 	sessionFileForTask?: (agentName: string, idx?: number) => string | undefined;
+	thinkingOverrideForTask?: (agentName: string, idx?: number) => AgentConfig["thinking"] | undefined;
 	artifactsDir: string;
 	artifactConfig: ArtifactConfig;
 	includeProgress?: boolean;
@@ -403,8 +411,11 @@ interface ChainExecutionParams {
 	nestedRoute?: NestedRouteInfo;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	worktreeBaseDir?: string;
 	timeoutMs?: number;
 	deadlineAt?: number;
+	/** Global cap on simultaneously-running tasks within this chain. Defaults to DEFAULT_GLOBAL_CONCURRENCY_LIMIT. */
+	globalConcurrencyLimit?: number;
 }
 
 interface ChainExecutionResult {
@@ -433,6 +444,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 		sessionDirForIndex,
 		sessionFileForIndex,
 		sessionFileForTask,
+		thinkingOverrideForTask,
 		artifactsDir,
 		artifactConfig,
 		includeProgress,
@@ -596,6 +608,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	}
 
 	const deadlineAt = params.deadlineAt ?? (params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined);
+	const globalSemaphore = new Semaphore(params.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
 	let prev = "";
 	let globalTaskIndex = 0;
 	let progressCreated = false;
@@ -622,6 +635,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 						setupHook: params.worktreeSetupHook
 							? { hookPath: params.worktreeSetupHook, timeoutMs: params.worktreeSetupHookTimeoutMs }
 							: undefined,
+						baseDir: params.worktreeBaseDir,
 					});
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
@@ -662,6 +676,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					sessionDirForIndex,
 					sessionFileForIndex,
 					sessionFileForTask,
+					thinkingOverrideForTask,
 					shareEnabled,
 					artifactConfig,
 					artifactsDir,
@@ -685,6 +700,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					maxSubagentDepth: params.maxSubagentDepth,
 					timeoutMs: params.timeoutMs,
 					deadlineAt,
+					globalSemaphore,
 				});
 				globalTaskIndex += step.parallel.length;
 
@@ -770,6 +786,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				if (worktreeSetup) cleanupWorktrees(worktreeSetup);
 			}
 		} else if (isDynamicParallelStep(step)) {
+			const dynamicStartIndex = globalTaskIndex;
+			const reservedDynamicItems = step.expand.maxItems ?? params.dynamicFanoutMaxItems ?? 0;
 			let materialized: ReturnType<typeof materializeDynamicParallelStep>;
 			try {
 				materialized = materializeDynamicParallelStep(step, outputs, stepIndex, { maxItems: params.dynamicFanoutMaxItems });
@@ -828,6 +846,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					}
 				}
 				prev = "Dynamic fanout produced 0 results.";
+				globalTaskIndex = dynamicStartIndex + reservedDynamicItems;
 				continue;
 			}
 
@@ -872,6 +891,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				sessionDirForIndex,
 				sessionFileForIndex,
 				sessionFileForTask,
+				thinkingOverrideForTask,
 				shareEnabled,
 				artifactConfig,
 				artifactsDir,
@@ -894,8 +914,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				maxSubagentDepth: params.maxSubagentDepth,
 				timeoutMs: params.timeoutMs,
 				deadlineAt,
+				globalSemaphore,
 			});
-			globalTaskIndex += dynamicParallelStep.parallel.length;
+			globalTaskIndex = dynamicStartIndex + reservedDynamicItems;
 
 			for (const result of parallelResults) {
 				results.push(result);
@@ -910,7 +931,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					content: [{ type: "text", text: `Chain paused after interrupt at step ${stepIndex + 1} (${interrupted.agent}). Waiting for explicit next action.` }],
 					details: buildChainExecutionDetails(makeDetailsInput({
 						currentStepIndex: stepIndex,
-						currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length + interruptedIndexInStep,
+						currentFlatIndex: dynamicStartIndex + interruptedIndexInStep,
 					})),
 				};
 			}
@@ -921,7 +942,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
 					details: buildChainExecutionDetails(makeDetailsInput({
 						currentStepIndex: stepIndex,
-						currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length + detachedIndexInStep,
+						currentFlatIndex: dynamicStartIndex + detachedIndexInStep,
 					})),
 				};
 			}
@@ -943,7 +964,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					isError: true,
 					details: buildChainExecutionDetails(makeDetailsInput({
 						currentStepIndex: stepIndex,
-						currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length + failures[0]!.originalIndex,
+						currentFlatIndex: dynamicStartIndex + failures[0]!.originalIndex,
 					})),
 				};
 			}
@@ -952,7 +973,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			} catch (error) {
 				const message = error instanceof DynamicFanoutError ? error.message : error instanceof Error ? error.message : String(error);
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
-				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length }));
+				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: dynamicStartIndex }));
 			}
 			outputs[step.collect.as] = {
 				text: JSON.stringify(collected),
@@ -1085,6 +1106,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				sessionDir: sessionDirForIndex(globalTaskIndex),
 				sessionFile: sessionFileForTask?.(seqStep.agent, globalTaskIndex)
 					?? sessionFileForIndex?.(globalTaskIndex),
+				thinkingOverride: thinkingOverrideForTask?.(seqStep.agent, globalTaskIndex),
 				share: shareEnabled,
 				artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 				artifactConfig,

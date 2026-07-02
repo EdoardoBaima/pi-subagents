@@ -16,14 +16,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { keyText, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import { discoverAgents } from "../agents/agents.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
 import { clearLegacyResultAnimationTimer, renderWidget, renderSubagentResult } from "../tui/render.ts";
-import { SubagentParams } from "./schemas.ts";
+import { SubagentParams, WaitParams } from "./schemas.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
@@ -32,10 +32,19 @@ import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template
 import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
+import { waitForSubagents } from "../runs/background/wait.ts";
 import registerSubagentNotify, { type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/pi-args.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
 import { loadConfig } from "./config.ts";
+import {
+	buildCompanionDoctorLines,
+	buildCompanionListLines,
+	collectCompanionStatuses,
+	handleCompanionCommand,
+	maybeSendCompanionStartupMessage,
+	resolveCompanionOrchestratorTarget,
+} from "./companion-suggestions.ts";
 import {
 	type Details,
 	type SubagentState,
@@ -250,7 +259,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	ensureAccessibleDir(ASYNC_DIR);
 	cleanupOldChainDirs();
 
-	const config = loadConfig();
+	let config = loadConfig();
 	const asyncByDefault = config.asyncByDefault === true;
 	const tempArtifactsDir = getArtifactsDir(null);
 	cleanupAllArtifactDirs(DEFAULT_ARTIFACT_CONFIG.cleanupDays);
@@ -259,6 +268,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		baseCwd: "",
 		currentSessionId: null,
 		subagentInProgress: false,
+		subagentSpawns: { sessionId: null, count: 0 },
 		asyncJobs: new Map(),
 		foregroundRuns: new Map(),
 		foregroundControls: new Map(),
@@ -270,6 +280,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		completionSeen: new Map(),
 		watcher: null,
 		watcherRestartTimer: null,
+		companionSuggestionStartupShown: false,
+		companionSuggestionListShown: false,
 		resultFileCoalescer: {
 			schedule: () => false,
 			clear: () => {},
@@ -295,12 +307,16 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
 
-	const { ensurePoller, handleStarted, handleComplete, resetJobs } = createAsyncJobTracker(pi, state, ASYNC_DIR);
+	const { ensurePoller, handleStarted, handleComplete, resetJobs, restoreActiveJobs } = createAsyncJobTracker(pi, state, ASYNC_DIR);
 	const executor = createSubagentExecutor({
 		pi,
 		state,
 		config,
 		asyncByDefault,
+		companionSuggestionLines: ({ surface, cwd, context, orchestratorTarget }) => {
+			const statuses = collectCompanionStatuses({ pi, config, cwd, context, orchestratorTarget });
+			return surface === "doctor" ? buildCompanionDoctorLines(statuses) : buildCompanionListLines(statuses);
+		},
 		tempArtifactsDir,
 		getSubagentSessionRoot,
 		expandTilde,
@@ -345,7 +361,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			text += `\n  ${theme.fg("dim", `⎿  ${line}`)}`;
 		}
 		if (!options.expanded && trimmedPreview.includes("\n")) {
-			text += `\n  ${theme.fg("dim", "Ctrl+O full notification")}`;
+			const expandKey = keyText("app.tools.expand");
+			text += `\n  ${theme.fg("dim", `${expandKey} full notification`)}`;
 		}
 		if (details.sessionLabel && details.sessionValue) {
 			text += `\n  ${theme.fg("muted", `${details.sessionLabel}: ${shortenPath(details.sessionValue)}`)}`;
@@ -418,6 +435,28 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}, 0);
 	}
 
+	pi.registerCommand("subagents-companions", {
+		description: "Show or hide pi-subagents companion package recommendations",
+		handler: async (args, ctx) => {
+			try {
+				const statuses = collectCompanionStatuses({
+					pi,
+					config,
+					cwd: ctx.cwd,
+					orchestratorTarget: resolveCompanionOrchestratorTarget(pi, ctx),
+				});
+				const result = handleCompanionCommand(args, ctx, statuses);
+				if (result.updatedConfig) config = result.updatedConfig;
+				pi.sendMessage({ content: result.text, display: true });
+				if (result.error && ctx.hasUI) ctx.ui.notify(result.text, "error");
+			} catch (error) {
+				const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+				pi.sendMessage({ content: `Failed to update companion suggestions: ${message}`, display: true });
+				if (ctx.hasUI) ctx.ui.notify(`Failed to update companion suggestions: ${message}`, "error");
+			}
+		},
+	});
+
 	const tool: ToolDefinition<typeof SubagentParams, Details> = {
 		name: "subagent",
 		label: "Subagent",
@@ -429,6 +468,7 @@ EXECUTION (use exactly ONE mode):
 • CHAIN: { chain: [{agent:"agent-a"}, {parallel:[{agent:"agent-b",count:3}]}] } - sequential pipeline with optional parallel fan-out
 • PARALLEL: { tasks: [{agent,task,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)
 • Optional context: { context: "fresh" | "fork" } (explicit value overrides every child; when omitted, each requested agent uses its own defaultContext, otherwise "fresh"; inspect agent defaults via { action: "list" })
+• Optional timeout: { timeoutMs } or { maxRuntimeMs } sets a run-level max runtime for foreground and async/background runs
 • If { action: "list" } shows proactive skill subagent suggestions, consider a small fresh-context fanout for broad tasks where one of those skills would materially help
 
 CHAIN TEMPLATE VARIABLES (use in task strings):
@@ -471,7 +511,7 @@ DIAGNOSTICS:
 			}
 			const isParallel = (args.tasks?.length ?? 0) > 0;
 			const parallelCount = effectiveParallelTaskCount(args.tasks as Array<{ count?: unknown }> | undefined);
-			const asyncLabel = args.async === true && args.clarify !== true && !isParallel ? theme.fg("warning", " [async]") : "";
+			const asyncLabel = args.async === true && args.clarify !== true ? theme.fg("warning", " [async]") : "";
 			if (args.chain?.length)
 				return new Text(
 					`${theme.fg("toolTitle", theme.bold("subagent "))}chain (${args.chain.length})${asyncLabel}`,
@@ -480,7 +520,7 @@ DIAGNOSTICS:
 				);
 			if (isParallel)
 				return new Text(
-					`${theme.fg("toolTitle", theme.bold("subagent "))}parallel (${parallelCount})`,
+					`${theme.fg("toolTitle", theme.bold("subagent "))}parallel (${parallelCount})${asyncLabel}`,
 					0,
 					0,
 				);
@@ -504,6 +544,27 @@ DIAGNOSTICS:
 	};
 
 	pi.registerTool(tool);
+
+	const waitTool: ToolDefinition<typeof WaitParams, Details> = {
+		name: "wait",
+		label: "Wait",
+		description: `Block until background (async) subagent runs started in this session finish, then return.
+
+Use this after launching async subagents when you have no independent work left and must not end your turn — for example inside a skill that has to run to completion, or any non-interactive run (\`pi -p ...\`) where the whole task is a single turn and ending it would abandon the still-running children.
+
+• { } — return as soon as the FIRST active run finishes (default). Ideal for a rolling fleet: launch N, wait, spawn a replacement for the one that finished, wait again — keeping N in flight.
+• { all: true } — block until EVERY active run in this session is finished.
+• { id: "..." } — wait for one specific run (id or prefix) to finish.
+• { timeoutMs: 600000 } — stop waiting after N ms (the runs keep going regardless; default 30 min)
+
+wait also returns when a run needs attention (a child that went idle or blocked for a decision), not only on completion — so a stuck child never stalls the loop; the summary names the run(s) to inspect/nudge/resume/interrupt. It wakes the instant a completion or control event arrives (subscribed to Pi's event bus, with a poll fallback that reconciles crashed runners), keeps the turn alive for normal notification delivery, and resolves early if the turn is aborted.`,
+		parameters: WaitParams,
+		execute(_id, params, signal, _onUpdate, _ctx) {
+			return waitForSubagents(params, signal, { state, events: pi.events });
+		},
+	};
+	pi.registerTool(waitTool);
+
 	registerSlashCommands(pi, state);
 
 	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
@@ -564,6 +625,7 @@ DIAGNOSTICS:
 	const resetSessionState = (ctx: ExtensionContext) => {
 		state.baseCwd = ctx.cwd;
 		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+		state.subagentSpawns = { sessionId: state.currentSessionId, count: 0 };
 		// Set PI_SUBAGENT_PARENT_SESSION for permission-system forwarding.
 		// Only set in the root session (the interactive UI session), not in
 		// child subagent processes — children inherit the parent's value
@@ -576,15 +638,30 @@ DIAGNOSTICS:
 			}
 		}
 		state.lastUiContext = ctx;
+		state.companionSuggestionStartupShown = false;
+		state.companionSuggestionListShown = false;
 		cleanupSessionArtifacts(ctx);
 		clearPendingForegroundControlNotices(state);
 		resetJobs(ctx);
+		restoreActiveJobs(ctx);
 		restoreSlashFinalSnapshots(ctx.sessionManager.getEntries());
 		primeExistingResults();
 	};
 
 	pi.on("session_start", (_event, ctx) => {
 		resetSessionState(ctx);
+		maybeSendCompanionStartupMessage({
+			pi,
+			ctx,
+			state,
+			statuses: collectCompanionStatuses({
+				pi,
+				config,
+				cwd: ctx.cwd,
+				orchestratorTarget: resolveCompanionOrchestratorTarget(pi, ctx),
+				fast: true,
+			}),
+		});
 	});
 
 	pi.on("session_shutdown", () => {
